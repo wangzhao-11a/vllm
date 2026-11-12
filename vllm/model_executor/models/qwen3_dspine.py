@@ -12,6 +12,8 @@ redo the final write for every (sender, candidate) pair.
 import math
 from collections.abc import Iterable
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -668,7 +670,11 @@ class DSpineQwen3Model(DFlashQwen3Model):
                 raise ValueError(
                     "DSPINE requires causal draft attention in every layer"
                 )
-            if layer.self_attn.sliding_window is not None:
+            if layer.self_attn.sliding_window is not None and os.environ.get(
+                "VLLM_DSPINE_ALLOW_SLIDING"
+            ) != "1":
+                # The 27B draft was trained with an 8192-token sliding window;
+                # allow it for the device validation lane.
                 raise ValueError("DSPINE drafts use full attention layers")
         self.selected_prefix_bridge = DSpineCodeBridge(
             self.config, params_dtype=vllm_config.model_config.dtype
@@ -737,6 +743,12 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if os.environ.get("VLLM_DSPINE_FREE_DRAFT_IO") == "1":
+            # The draft ships no embed_tokens/lm_head; the DFlash loader shares
+            # the target modules. Release the placeholder copies early: for the
+            # 27B vocab they are 2 * V*H*2 bytes each and OOM a 64G card.
+            self.model.embed_tokens = torch.nn.Identity()
+            self.lm_head = torch.nn.Identity()
         self.head_topk = self.model.head_topk
         self.candidate_logits_processor = LogitsProcessor(
             vllm_config.model_config.get_vocab_size()

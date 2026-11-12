@@ -5,6 +5,11 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
+from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -47,13 +52,21 @@ class DSpineSpeculator(DFlash2Speculator):
                 "DSpine requires an unquantized row-contiguous BF16/FP32 target lm_head"
             )
         shard = getattr(lm_head, "shard_indices", None)
-        if shard is not None and (
-            int(shard.num_added_elements) or int(shard.org_vocab_start_index)
-        ):
-            raise ValueError(
-                "DSpine does not support added or offset target vocabulary"
-            )
-        model.materialize_inference_buffers(weight)
+        if shard is not None and int(shard.num_added_elements):
+            # A nonzero vocab offset is normal for TP shards; the full head is
+            # rebuilt below by all_gather when TP > 1.
+            raise ValueError("DSpine does not support added target vocabulary")
+        tp_size = get_tensor_model_parallel_world_size()
+        build_weight = weight
+        if tp_size > 1:
+            # Only the serial-table build needs the full vocabulary; the
+            # candidate top-k runs on the sharded head and reduces over TP.
+            full = get_tp_group().all_gather(weight.detach(), dim=0)
+            org_vocab = int(getattr(lm_head, "org_vocab_size", 0) or 0)
+            if org_vocab:
+                full = full[:org_vocab]
+            build_weight = full.contiguous()
+        model.materialize_inference_buffers(build_weight)
         return model
 
     def _generate_draft(
